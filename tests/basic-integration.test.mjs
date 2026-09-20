@@ -1,0 +1,52 @@
+// Opt in against an EMPTY disposable database, never a production database.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import mysql from 'mysql2/promise';
+import { randomUUID } from 'node:crypto';
+import { basicService } from '../server/basic-service.mjs';
+const enabled=process.env.LEDGER_TEST_DATABASE==='disposable';
+test('MariaDB workflows: persistence, ownership, payments, imports, matching and rollback',{skip:!enabled},async t=>{
+ const pool=mysql.createPool({host:process.env.DB_HOST,port:Number(process.env.DB_PORT||3306),user:process.env.DB_USER,password:process.env.DB_PASSWORD,database:process.env.DB_NAME,connectionLimit:4});t.after(()=>pool.end());
+ const time=new Date().toISOString(),day=time.slice(0,10);const a={userId:randomUUID(),businessId:randomUUID()},b={userId:randomUUID(),businessId:randomUUID()};
+ for(const ctx of [a,b]){await pool.execute('INSERT INTO users (id,email,name,created_at,updated_at) VALUES (?,?,?,?,?)',[ctx.userId,ctx.userId+'@test.invalid','Test',time,time]);await pool.execute('INSERT INTO businesses (id,owner_user_id,name,accounting_year_start,created_at,updated_at) VALUES (?,?,?,?,?,?)',[ctx.businessId,ctx.userId,'Test business','2026-01-01',time,time]);}
+ const call=(op,body={},ctx=a)=>basicService(pool,ctx,op,body);
+ assert.equal((await call('list')).contacts.length,0);
+ const contact={name:'Ada',company:'Ada Ltd',type:'customer',email:'ada@example.test',address:{line1:'1 Test Road',city:'Leeds',country:'UK'}};
+ const {id:contactId}=await call('contact.save',contact);await call('contact.save',{...contact,id:contactId,telephone:'01234',name:'Ada Updated'});
+ assert.equal((await call('list')).contacts[0].name,'Ada Updated');assert.equal((await call('list',{},b)).contacts.length,0);
+ await assert.rejects(call('contact.save',{...contact,id:contactId},b),/not found/);
+ const invoice={contact_id:contactId,issue_date:day,due_date:day,items:[{description:'Service',quantity:'2',unit_price:'10.00',tax_rate:'20'},{description:'Extra',quantity:'1',unit_price:'0.10',tax_rate:'0'}]};
+ await assert.rejects(call('invoice.save',{...invoice,items:[{description:'Invalid',quantity:'1',unit_price:'-1',tax_rate:'0'}]}));
+ const {id:invoiceId}=await call('invoice.save',invoice);assert.equal((await call('invoice.get',{id:invoiceId})).invoice.amount,'24.10');
+ await call('invoice.save',{...invoice,id:invoiceId,reference:'Edited'});await assert.rejects(call('invoice.get',{id:invoiceId},b),/not found/);
+ await call('invoice.status',{id:invoiceId,status:'sent'});await assert.rejects(call('invoice.save',{...invoice,id:invoiceId}),/draft/);
+ await Promise.all([call('invoice.status',{id:invoiceId,status:'paid',payment_date:day}),call('invoice.status',{id:invoiceId,status:'paid',payment_date:day})]);
+ const paid=await call('invoice.get',{id:invoiceId});assert.equal(paid.payments.length,1);const saleId=paid.payments[0].entry_id;assert.equal((await call('list')).entries.length,1);
+ await assert.rejects(call('invoice.delete',{id:invoiceId}),/draft/);
+ const {id:draft}=await call('invoice.save',invoice);await call('invoice.delete',{id:draft});await assert.rejects(call('invoice.get',{id:draft}),/not found/);
+ const account={name:'Current',bank_name:'Test Bank',reference:'1234',account_type:'Current',currency:'GBP',opening_balance:'100.00',opening_date:'2026-01-01'};
+ const {id:accountId}=await call('account.save',account);await call('account.save',{...account,id:accountId,name:'Edited account'});
+ await assert.rejects(call('bank.list',{account_id:accountId},b),/not found/);
+ const csv=`Date,Description,Amount\n${day},Invoice payment,24.10\n${day},Supplies,-10.00\n${day},Transfer,50.00`,mapping={date:0,description:1,amount:2};
+ const preview=await call('bank.preview',{account_id:accountId,csv,mapping});assert.equal(preview.rows.length,3);
+ await call('bank.import',{account_id:accountId,csv,mapping});await assert.rejects(call('bank.import',{account_id:accountId,csv,mapping}),/duplicate/);
+ const duplicate=await call('bank.preview',{account_id:accountId,csv,mapping});assert.ok(duplicate.rows.every(r=>r.duplicate));
+ const skipped=await call('bank.import',{account_id:accountId,csv,mapping,decisions:{2:'skip',3:'skip',4:'skip'}});assert.equal(skipped.imported,0);
+ let bank=await call('bank.list',{account_id:accountId});assert.equal(bank.balance,'164.10');
+ const payment=bank.transactions.find(t=>t.amount==='24.10'),cost=bank.transactions.find(t=>t.amount==='-10.00'),transfer=bank.transactions.find(t=>t.amount==='50.00');
+ await assert.rejects(call('bank.process',{account_id:accountId,id:payment.id,classification:'match',entry_id:saleId,reconcile:true},b),/not found/);
+ await call('bank.process',{account_id:accountId,id:payment.id,classification:'match',entry_id:saleId,reconcile:true});
+ await assert.rejects(call('bank.process',{account_id:accountId,id:payment.id,classification:'create',party:'Double',category:'Other'}),/Reconciled/);
+ await call('bank.process',{account_id:accountId,id:cost.id,classification:'create',party:'Stationer',category:'Office',reconcile:true});
+ await call('bank.process',{account_id:accountId,id:transfer.id,classification:'transfer',reconcile:true});
+ bank=await call('bank.list',{account_id:accountId});assert.ok(bank.transactions.every(t=>t.status==='RECONCILED'));
+ const [sales]=await pool.execute("SELECT * FROM entries WHERE business_id=? AND kind='sale'",[a.businessId]);assert.equal(sales.length,1);
+ await assert.rejects(call('account.save',{...account,id:accountId,opening_balance:'500.00'}),/cannot change/);
+ await call('contact.archive',{id:contactId,archived:true});assert.equal((await call('list')).contacts[0].archived,1);assert.equal((await call('invoice.get',{id:invoiceId})).invoice.customer,'Ada Ltd');
+ await call('account.archive',{id:accountId,archived:true});await assert.rejects(call('bank.import',{account_id:accountId,csv,mapping}),/archived/);
+ const [audit]=await pool.execute('SELECT * FROM accounting_audit WHERE business_id=?',[a.businessId]);assert.ok(audit.length>=12);
+ // Full SQL rollback: a bad later row must leave no preceding imported rows.
+ const {id:second}=await call('account.save',account);
+ await assert.rejects(call('bank.import',{account_id:second,csv:`Date,Description,Amount\n${day},Good,1.00\n31/02/2026,Bad,2.00`,mapping}),/row 3/);
+ assert.equal((await call('bank.list',{account_id:second})).transactions.length,0);
+});

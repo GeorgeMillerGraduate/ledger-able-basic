@@ -1,0 +1,1 @@
+import"./navigation-1oAS7xI4.js";function e(e,t){return null}function t(e,t){return null}export{e as resolveHybridClientRewriteHref,t as resolveHybridClientRouteOwner};
